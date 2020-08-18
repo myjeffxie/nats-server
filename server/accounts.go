@@ -14,7 +14,6 @@
 package server
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/hex"
 	"errors"
@@ -23,7 +22,6 @@ import (
 	"math"
 	"math/rand"
 	"net/http"
-	"net/textproto"
 	"net/url"
 	"reflect"
 	"sort"
@@ -124,7 +122,7 @@ type serviceImport struct {
 	invalid     bool
 	share       bool
 	tracking    bool
-	trackingHdr *http.Header // header in request
+	trackingHdr http.Header // header from request
 }
 
 // This is used to record when we create a mapping for implicit service
@@ -183,7 +181,7 @@ type serviceExport struct {
 
 // Used to track service latency.
 type serviceLatency struct {
-	sampling int8
+	sampling int8 // percentage from 1-100 or 0 to indicate triggered by header
 	subject  string
 }
 
@@ -811,7 +809,7 @@ type ServiceLatency struct {
 	Requestor LatencyClient `json:"requestor,omitempty"`
 	Responder LatencyClient `json:"responder,omitempty"`
 	// only contains a value if the header are shared by importer
-	RequestHeader  *http.Header  `json:"header,omitempty"`
+	RequestHeader  http.Header   `json:"header,omitempty"`
 	RequestStart   time.Time     `json:"start"`
 	ServiceLatency time.Duration `json:"service"`
 	SystemLatency  time.Duration `json:"system"`
@@ -893,7 +891,7 @@ func (a *Account) sendLatencyResult(si *serviceImport, sl *ServiceLatency) {
 }
 
 // Used to send a bad request metric when we do not have a reply subject
-func (a *Account) sendBadRequestTrackingLatency(si *serviceImport, requestor *client, header *http.Header) {
+func (a *Account) sendBadRequestTrackingLatency(si *serviceImport, requestor *client, header http.Header) {
 	sl := &ServiceLatency{
 		Status:    400,
 		Error:     "Bad Request",
@@ -1392,11 +1390,7 @@ func (a *Account) addServiceImportSub(si *serviceImport) error {
 	a.mu.Unlock()
 
 	cb := func(sub *subscription, c *client, subject, reply string, msg []byte) {
-		hdr := c.pa.hdr
-		if hdr < 0 {
-			hdr = 0
-		}
-		c.processServiceImport(si, a, msg, msg[:hdr])
+		c.processServiceImport(si, a, msg)
 	}
 	_, err := c.processSub([]byte(subject), nil, []byte(sid), cb, true)
 	return err
@@ -1432,66 +1426,59 @@ func (a *Account) addAllServiceImportSubs() {
 	}
 }
 
-// Helper to determine when to sample.
-func shouldSample(l *serviceLatency, hdr []byte) (bool, *http.Header) {
+// Helper to determine when to sample. When header has a value, sampling is driven by header
+func shouldSample(l *serviceLatency, c *client) (bool, http.Header) {
 	if l == nil {
 		return false, nil
 	}
-	var header *http.Header
-	if len(hdr) > 0 {
-		reader := bufio.NewReader(strings.NewReader(string(hdr)))
-		tp := textproto.NewReader(reader)
-		tp.ReadLine() // skip over first line contains version
-		mimeHeader, _ := tp.ReadMIMEHeader()
-		h := http.Header(mimeHeader)
-		header = &h
-		if tId := h.Get("Uber-Trace-Id"); tId != "" {
-			tk := strings.Split(tId, ":")
-			if len(tk) == 4 && len(tk[3]) > 0 && len(tk[3]) <= 2 {
-				dst := [2]byte{}
-				src := [2]byte{'0', tk[3][0]}
-				if len(tk[3]) == 2 {
-					src[1] = tk[3][1]
-				}
-				if _, err := hex.Decode(dst[:], src[:]); err == nil && dst[0]&1 == 1 {
-					return true, header
-				}
-			}
-			return false, nil
-		} else if sampled := h.Get("X-B3-Sampled"); sampled == "1" {
-			return true, header // allowed
-		} else if sampled == "0" {
-			return false, nil // denied
-		} else if h.Get("X-B3-TraceId") != "" {
-			return true, header // sampling left to recipient
-		} else if b3 := h.Get("B3"); b3 != "" {
-			tk := strings.Split(b3, "-")
-			if len(tk) > 2 && tk[2] == "0" {
-				return false, nil // denied
-			} else if len(tk) == 1 && tk[0] == "0" {
-				return false, nil // denied
-			}
-			// sampling allowed of left to recipient of header
-			return true, header
-		} else if trcP := h.Get("traceparent"); trcP != "" {
-			tk := strings.Split(trcP, "-")
-			if len(tk) == 4 && len([]byte(tk[3])) == 2 && tk[3] == "01" {
-				return true, header
-			} else {
-				return false, nil
-			}
-		}
-		// as of now include header when we do normal sampling
-		header = nil
-	}
-	if l.sampling <= 0 {
+	if l.sampling < 0 {
 		return false, nil
 	}
 	if l.sampling >= 100 {
-		return true, header
+		return true, nil
 	}
-	if rand.Int31n(100) <= int32(l.sampling) {
-		return true, header
+	if l.sampling > 0 && rand.Int31n(100) <= int32(l.sampling) {
+		return true, nil
+	}
+	h := c.parseState.getHeader()
+	if h == nil {
+		return false, nil
+	}
+	if tId := h.Get("Uber-Trace-Id"); tId != "" {
+		tk := strings.Split(tId, ":")
+		if len(tk) == 4 && len(tk[3]) > 0 && len(tk[3]) <= 2 {
+			dst := [2]byte{}
+			src := [2]byte{'0', tk[3][0]}
+			if len(tk[3]) == 2 {
+				src[1] = tk[3][1]
+			}
+			if _, err := hex.Decode(dst[:], src[:]); err == nil && dst[0]&1 == 1 {
+				return true, h
+			}
+		}
+		return false, nil
+	} else if sampled := h.Get("X-B3-Sampled"); sampled == "1" {
+		return true, h // allowed
+	} else if sampled == "0" {
+		return false, nil // denied
+	} else if h.Get("X-B3-TraceId") != "" {
+		return true, h // sampling left to recipient
+	} else if b3 := h.Get("B3"); b3 != "" {
+		tk := strings.Split(b3, "-")
+		if len(tk) > 2 && tk[2] == "0" {
+			return false, nil // denied
+		} else if len(tk) == 1 && tk[0] == "0" {
+			return false, nil // denied
+		}
+		// sampling allowed of left to recipient of header
+		return true, h
+	} else if trcP := h.Get("traceparent"); trcP != "" {
+		tk := strings.Split(trcP, "-")
+		if len(tk) == 4 && len([]byte(tk[3])) == 2 && tk[3] == "01" {
+			return true, h
+		} else {
+			return false, nil
+		}
 	}
 	return false, nil
 }
@@ -1523,7 +1510,7 @@ func (a *Account) processServiceImportResponse(sub *subscription, c *client, sub
 	a.mu.RUnlock()
 
 	// Send for normal processing.
-	c.processServiceImport(si, a, msg, nil)
+	c.processServiceImport(si, a, msg)
 }
 
 // Will create a wildcard subscription to handle interest graph propagation for all
@@ -1697,7 +1684,7 @@ func (a *Account) SetServiceExportResponseThreshold(export string, maxTime time.
 }
 
 // This is for internal service import responses.
-func (a *Account) addRespServiceImport(dest *Account, to string, osi *serviceImport, tracking bool, header *http.Header) *serviceImport {
+func (a *Account) addRespServiceImport(dest *Account, to string, osi *serviceImport, tracking bool, header http.Header) *serviceImport {
 	nrr := string(osi.acc.newServiceReply(tracking))
 
 	a.mu.Lock()

@@ -1427,6 +1427,7 @@ func TestServiceLatencyRequestorSharesConfig(t *testing.T) {
 }
 
 func TestServiceLatencyLossTest(t *testing.T) {
+	// assure that behavior with respect to requests timing out (and samples being reordered) is as expected.
 	conf := createConfFile(t, []byte(`
 		listen: 127.0.0.1:-1
 		accounts: {
@@ -1434,6 +1435,7 @@ func TestServiceLatencyLossTest(t *testing.T) {
 		        users: [ {user: svc, password: pass} ]
 		        exports: [  {
 					service: "svc.echo"
+					threshold: "5s"
 					accounts: [CLIENT]
 					latency: {
 						sampling: headers
@@ -1449,7 +1451,6 @@ func TestServiceLatencyLossTest(t *testing.T) {
 		}
 		system_account: SYS
 	`))
-	// TODO is there an option to reduce service import cleanup?
 	defer os.Remove(conf)
 	srv, opts := RunServerWithConfig(conf)
 	defer srv.Shutdown()
@@ -1478,6 +1479,7 @@ func TestServiceLatencyLossTest(t *testing.T) {
 	wg := sync.WaitGroup{}
 	wg.Add(2)
 	rsub, _ := ncl.Subscribe("latency.svc", func(rmsg *nats.Msg) {
+		defer wg.Done()
 		var sl server.ServiceLatency
 		json.Unmarshal(rmsg.Data, &sl)
 		msgCnt++
@@ -1493,7 +1495,6 @@ func TestServiceLatencyLossTest(t *testing.T) {
 		if strings.EqualFold(sl.RequestHeader.Get("Uber-Trace-Id"), fmt.Sprintf("msg-%d", msgCnt)) {
 			latErr = append(latErr, fmt.Errorf("no header present"))
 		}
-		wg.Done()
 	})
 	defer rsub.Unsubscribe()
 	// Setup requestor
@@ -1513,7 +1514,8 @@ func TestServiceLatencyLossTest(t *testing.T) {
 	nc2.Flush()
 	// use dedicated send that publishes requests using same reply subject
 	send := func(msg string) {
-		if err := nc2.PublishMsg(&nats.Msg{Subject: "SVC", Data: []byte(msg), Reply: reply, Header: http.Header{"Uber-Trace-Id": []string{msg}}}); err != nil {
+		if err := nc2.PublishMsg(&nats.Msg{Subject: "SVC", Data: []byte(msg), Reply: reply,
+			Header: http.Header{"X-B3-Sampled": []string{"1"}}}); err != nil {
 			t.Fatalf("Expected a response got: %v", err)
 		}
 	}

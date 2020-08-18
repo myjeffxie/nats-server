@@ -3340,7 +3340,7 @@ func (c *client) handleGWReplyMap(msg []byte) bool {
 }
 
 // Used to setup the response map for a service import request that has a reply subject.
-func (c *client) setupResponseServiceImport(acc *Account, si *serviceImport, tracking bool, header *http.Header) *serviceImport {
+func (c *client) setupResponseServiceImport(acc *Account, si *serviceImport, tracking bool, header http.Header) *serviceImport {
 	rsi := si.acc.addRespServiceImport(acc, string(c.pa.reply), si, tracking, header)
 	if si.latency != nil {
 		if c.rtt == 0 {
@@ -3356,7 +3356,7 @@ func (c *client) setupResponseServiceImport(acc *Account, si *serviceImport, tra
 
 // processServiceImport is an internal callback when a subscription matches an imported service
 // from another account. This includes response mappings as well.
-func (c *client) processServiceImport(si *serviceImport, acc *Account, msg []byte, hdr []byte) {
+func (c *client) processServiceImport(si *serviceImport, acc *Account, msg []byte) {
 	if c.kind == GATEWAY && !si.isRespServiceImport() {
 		return
 	}
@@ -3375,7 +3375,7 @@ func (c *client) processServiceImport(si *serviceImport, acc *Account, msg []byt
 
 	// Check if there is a reply present and set up a response.
 	// TODO(dlc) - restrict to configured service imports and not responses?
-	tracking, headers := shouldSample(si.latency, hdr)
+	tracking, headers := shouldSample(si.latency, c)
 	if !share {
 		headers = nil
 	}
